@@ -1,0 +1,21 @@
+[package]
+name = "vmod-k8s-endpoint"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+kube = { version = "0.96", features = ["runtime", "derive", "client"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+futures = "0.3"
+k8s-openapi = { version = "0.23", features = ["v1_28"] }
+http = "1"
+varnish = { version = "0.7.0", features = ["ffi"] }
+rand = "0.9"
+indexmap = "2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(varnishsys_90_sslflags)'] }
+
+[lib]
+crate-type = ["cdylib"]
