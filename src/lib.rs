@@ -1,141 +1,3 @@
-#[cfg(test)]
-mod tests {
-    use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort, EndpointSlice};
-
-    varnish::run_vtc_tests!("tests/*.vtc");
-
-    fn make_endpoint_slice(ips: &[&str], ports: &[(&str, i32)]) -> EndpointSlice {
-        EndpointSlice {
-            endpoints: ips.iter().map(|ip| Endpoint {
-                addresses: vec![ip.to_string()],
-                conditions: Some(EndpointConditions { ready: Some(true), ..Default::default() }),
-                ..Default::default()
-            }).collect(),
-            ports: Some(ports.iter().map(|(name, port)| EndpointPort {
-                name: Some(name.to_string()),
-                port: Some(*port),
-                ..Default::default()
-            }).collect()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn service_uri_plain_http() {
-        let u = super::ServiceUri::parse("http://my-service").expect("valid URI");
-        assert_eq!(u.service, "my-service");
-        assert!(!u.use_tls);
-    }
-
-    #[test]
-    fn service_uri_https() {
-        let u = super::ServiceUri::parse("https://my-service").expect("valid URI");
-        assert_eq!(u.service, "my-service");
-        assert!(u.use_tls);
-    }
-
-    #[test]
-    fn service_uri_trailing_slash() {
-        let u = super::ServiceUri::parse("http://my-service/").expect("valid URI");
-        assert_eq!(u.service, "my-service");
-    }
-
-    #[test]
-    fn service_uri_no_scheme() {
-        // bare hostname: no scheme, no host — http crate puts input in path segment
-        let u = super::ServiceUri::parse("my-service").expect("valid URI");
-        assert_eq!(u.service, "my-service");
-        assert!(!u.use_tls);
-    }
-
-    #[test]
-    fn service_uri_bare_with_hyphen() {
-        let u = super::ServiceUri::parse("my-service-foo").expect("valid URI");
-        assert_eq!(u.service, "my-service-foo");
-        assert!(!u.use_tls);
-    }
-
-    #[test]
-    fn service_uri_unknown_scheme_is_err() {
-        assert!(super::ServiceUri::parse("ftp://my-service").is_err());
-        assert!(super::ServiceUri::parse("grpc://my-service").is_err());
-    }
-
-    #[test]
-    fn service_uri_with_path_is_err() {
-        assert!(super::ServiceUri::parse("http://my-service/path").is_err());
-        assert!(super::ServiceUri::parse("my-service/path").is_err());
-    }
-
-    #[test]
-    fn service_uri_with_query_is_err() {
-        assert!(super::ServiceUri::parse("http://my-service?q=1").is_err());
-    }
-
-    #[test]
-    fn service_uri_empty_is_err() {
-        assert!(super::ServiceUri::parse("").is_err());
-    }
-
-    #[test]
-    fn service_uri_no_host_is_err() {
-        assert!(super::ServiceUri::parse("http://").is_err());
-    }
-
-    #[test]
-    fn extract_endpoints_no_ports() {
-        let ep = EndpointSlice { ..Default::default() };
-        assert!(super::extract_endpoints(&ep, "http").is_empty());
-    }
-
-    #[test]
-    fn extract_endpoints_port_absent() {
-        let ep = make_endpoint_slice(&["10.0.0.1"], &[("metrics", 9090)]);
-        assert!(super::extract_endpoints(&ep, "http").is_empty());
-    }
-
-    #[test]
-    fn extract_endpoints_multiple_ips() {
-        let ep = make_endpoint_slice(&["10.0.0.1", "10.0.0.2"], &[("http", 8080)]);
-        let result = super::extract_endpoints(&ep, "http");
-        assert_eq!(result.len(), 2);
-        assert!(result.contains("10.0.0.1:8080"));
-        assert!(result.contains("10.0.0.2:8080"));
-    }
-
-    #[test]
-    fn extract_endpoints_ipv6() {
-        let ep = make_endpoint_slice(&["::1", "fe80::1"], &[("http", 8080)]);
-        let result = super::extract_endpoints(&ep, "http");
-        assert_eq!(result.len(), 2);
-        assert!(result.contains("[::1]:8080"));
-        assert!(result.contains("[fe80::1]:8080"));
-    }
-
-    #[test]
-    fn extract_endpoints_mixed_ports() {
-        let ep = make_endpoint_slice(&["10.0.0.1"], &[("http", 8080), ("grpc", 9000)]);
-        let result = super::extract_endpoints(&ep, "http");
-        assert_eq!(result.len(), 1);
-        assert!(result.contains("10.0.0.1:8080"));
-    }
-
-    #[test]
-    fn extract_endpoints_unready_excluded() {
-        let mut ep = make_endpoint_slice(&["10.0.0.1"], &[("http", 8080)]);
-        ep.endpoints[0].conditions = Some(EndpointConditions { ready: Some(false), ..Default::default() });
-        assert!(super::extract_endpoints(&ep, "http").is_empty());
-    }
-
-    #[test]
-    fn extract_endpoints_ready_none_included() {
-        let mut ep = make_endpoint_slice(&["10.0.0.1"], &[("http", 8080)]);
-        ep.endpoints[0].conditions = None;
-        let result = super::extract_endpoints(&ep, "http");
-        assert!(result.contains("10.0.0.1:8080"));
-    }
-}
-
 use futures::{Stream, TryStreamExt};
 use http::Uri;
 use indexmap::IndexMap;
@@ -151,6 +13,89 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep_until, Instant};
 use varnish::ffi;
 use varnish::vcl::{log as vsl_log, BackendRef, Ctx, LogTag, NativeBackend, NativeBackendBuilder};
+
+#[varnish::vmod(docs = "API.md")]
+mod k8s_endpoint {
+    //! VMOD export wrapper used by varnish-rs to generate VMOD bindings.
+    use super::*;
+
+    impl VmodDirector {
+        /// Construct a new director and start watching the given Kubernetes service.
+        /// Creates a dedicated Tokio runtime and spawns a background watcher task on it.
+        ///
+        /// `namespace`: Kubernetes namespace to watch. Defaults to the namespace from the active
+        /// kubeconfig context or service-account (when running in-cluster).
+        pub fn new(
+            ctx: &mut Ctx,
+            service_uri: &str,
+            port_name: &str,
+            namespace: Option<&str>,
+        ) -> Result<Self, String> {
+            let service = ServiceUri::parse(service_uri).map_err(|e| e.to_string())?;
+
+            #[cfg(not(varnishsys_90_sslflags))]
+            if service.use_tls {
+                return Err("TLS requested but Varnish was built without SSL support".to_string());
+            }
+
+            let backends = Arc::new(RwLock::new(IndexMap::new()));
+
+            // Build a dedicated runtime to host background tasks for this director.
+            let runtime = Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            let client = runtime
+                .block_on(Client::try_default())
+                .map_err(|e| e.to_string())?;
+            let effective_ns = namespace
+                .map(str::to_string)
+                .unwrap_or_else(|| client.default_namespace().to_string());
+
+            let endpoints_api: Api<EndpointSlice> = Api::namespaced(client, &effective_ns);
+            let watcher_config = Config {
+                label_selector: Some(format!("kubernetes.io/service-name={}", service.service)),
+                ..Default::default()
+            };
+            let stream = kube::runtime::watcher(endpoints_api, watcher_config);
+
+            let vcl = super::RawVclPtr(ctx.raw.vcl.0);
+            let port_name = port_name.to_string();
+            runtime.spawn(super::watch_endpoints(
+                stream,
+                port_name,
+                service.service,
+                service.use_tls,
+                backends.clone(),
+                vcl,
+            ));
+
+            Ok(VmodDirector { backends, runtime })
+        }
+
+        /// Return a randomly selected backend from the current pool, or `None` if empty.
+        pub fn backend(&self) -> Option<BackendRef> {
+            let map = self.backends.read().expect("backends lock poisoned");
+            if map.is_empty() {
+                return None;
+            }
+            let idx = rand::random_range(0..map.len());
+            map.get_index(idx).map(|(_, v)| v.0.clone())
+        }
+
+        /// Return a pretty-printed JSON object listing all currently active backend addresses.
+        pub fn dump(&self) -> String {
+            let map = self.backends.read().expect("backends lock poisoned");
+            if map.is_empty() {
+                return "{\n  \"backends\": []\n}".to_string();
+            }
+            let entries: Vec<String> = map.keys()
+                .map(|addr| format!("    \"{}\"", addr))
+                .collect();
+            format!("{{\n  \"backends\": [\n{}\n  ]\n}}", entries.join(",\n"))
+        }
+    }
+}
 
 // Wraps `*mut ffi::vcl` to make it `Send`.
 // Safety: the VCL pointer must remain valid for the entire lifetime of the Tokio runtime that owns this pointer.
@@ -181,7 +126,10 @@ impl ServiceUri {
             if svc.contains('/') || parsed.query().is_some() {
                 return Err("invalid service name".into());
             }
-            return Ok(ServiceUri { use_tls: false, service: svc.to_string() });
+            return Ok(ServiceUri {
+                use_tls: false,
+                service: svc.to_string(),
+            });
         }
 
         let path = parsed.path();
@@ -207,14 +155,18 @@ impl ServiceUri {
 }
 
 fn extract_endpoints(ep: &EndpointSlice, port_name: &str) -> HashSet<String> {
-    let Some(port) = ep.ports.iter().flatten()
+    let Some(port) = ep
+        .ports
+        .iter()
+        .flatten()
         .find(|p| p.name.as_deref() == Some(port_name))
         .and_then(|p| p.port)
     else {
         return HashSet::new();
     };
 
-    ep.endpoints.iter()
+    ep.endpoints
+        .iter()
         .filter(|e| e.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true))
         .flat_map(|e| e.addresses.iter())
         .map(|ip| {
@@ -248,7 +200,7 @@ async fn watch_endpoints(
     backends: Arc<RwLock<IndexMap<String, SendableBackendRef>>>,
     raw_vcl: RawVclPtr,
 ) {
-    const GC_GRACE: Duration = Duration::from_secs(1);
+    const GC_GRACE: Duration = Duration::from_secs(65);
     // Suppress unused-variable warnings on Varnish builds without SSL flags.
     #[cfg(not(varnishsys_90_sslflags))]
     let _ = (use_tls, service_name);
@@ -359,7 +311,7 @@ async fn watch_endpoints(
                 let new_backends: Vec<(String, NativeBackend)> = to_create
                     .into_iter()
                     .filter_map(|(addr_str, sock_addr)| {
-                        let name = CString::new(format!("k8s_endpoint.{addr_str}"))
+                        let name = CString::new(format!("k8s_endpoint.ep({addr_str})"))
                             .expect("endpoint addr contains null byte");
                         let builder = NativeBackendBuilder::new_ip(&name, sock_addr);
                         #[cfg(varnishsys_90_sslflags)]
@@ -408,66 +360,158 @@ pub struct VmodDirector {
     runtime: Runtime,
 }
 
-#[varnish::vmod(docs = "API.md")]
-mod k8s_endpoint {
-    //! VMOD export wrapper used by varnish-rs to generate VMOD bindings.
-    use super::*;
+#[cfg(test)]
+mod tests {
+    use k8s_openapi::api::discovery::v1::{
+        Endpoint, EndpointConditions, EndpointPort, EndpointSlice,
+    };
 
-    impl VmodDirector {
-        /// Construct a new director and start watching the given Kubernetes service.
-        /// Creates a dedicated Tokio runtime and spawns a background watcher task on it.
-        ///
-        /// `namespace`: Kubernetes namespace to watch. Defaults to the namespace from the active
-        /// kubeconfig context or service-account (when running in-cluster).
-        pub fn new(
-            ctx: &mut Ctx,
-            service_uri: &str,
-            port_name: &str,
-            namespace: Option<&str>,
-        ) -> Result<Self, String> {
-            let service = ServiceUri::parse(service_uri).map_err(|e| e.to_string())?;
+    varnish::run_vtc_tests!("tests/*.vtc");
 
-            #[cfg(not(varnishsys_90_sslflags))]
-            if service.use_tls {
-                return Err("TLS requested but Varnish was built without SSL support".to_string());
-            }
-
-            let backends = Arc::new(RwLock::new(IndexMap::new()));
-
-            // Build a dedicated runtime to host background tasks for this director.
-            let runtime = Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| e.to_string())?;
-            let client = runtime
-                .block_on(Client::try_default())
-                .map_err(|e| e.to_string())?;
-            let effective_ns = namespace
-                .map(str::to_string)
-                .unwrap_or_else(|| client.default_namespace().to_string());
-
-            let endpoints_api: Api<EndpointSlice> = Api::namespaced(client, &effective_ns);
-            let watcher_config = Config {
-                label_selector: Some(format!("kubernetes.io/service-name={}", service.service)),
-                ..Default::default()
-            };
-            let stream = kube::runtime::watcher(endpoints_api, watcher_config);
-
-            let vcl = super::RawVclPtr(ctx.raw.vcl.0);
-            let port_name = port_name.to_string();
-            runtime.spawn(super::watch_endpoints(stream, port_name, service.service, service.use_tls, backends.clone(), vcl));
-
-            Ok(VmodDirector { backends, runtime })
+    fn make_endpoint_slice(ips: &[&str], ports: &[(&str, i32)]) -> EndpointSlice {
+        EndpointSlice {
+            endpoints: ips
+                .iter()
+                .map(|ip| Endpoint {
+                    addresses: vec![ip.to_string()],
+                    conditions: Some(EndpointConditions {
+                        ready: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+                .collect(),
+            ports: Some(
+                ports
+                    .iter()
+                    .map(|(name, port)| EndpointPort {
+                        name: Some(name.to_string()),
+                        port: Some(*port),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
         }
+    }
 
-        /// Return a randomly selected backend from the current pool, or `None` if empty.
-        pub fn backend(&self) -> Option<BackendRef> {
-            let map = self.backends.read().expect("backends lock poisoned");
-            if map.is_empty() {
-                return None;
-            }
-            let idx = rand::random_range(0..map.len());
-            map.get_index(idx).map(|(_, v)| v.0.clone())
-        }
+    #[test]
+    fn service_uri_plain_http() {
+        let u = super::ServiceUri::parse("http://my-service").expect("valid URI");
+        assert_eq!(u.service, "my-service");
+        assert!(!u.use_tls);
+    }
+
+    #[test]
+    fn service_uri_https() {
+        let u = super::ServiceUri::parse("https://my-service").expect("valid URI");
+        assert_eq!(u.service, "my-service");
+        assert!(u.use_tls);
+    }
+
+    #[test]
+    fn service_uri_trailing_slash() {
+        let u = super::ServiceUri::parse("http://my-service/").expect("valid URI");
+        assert_eq!(u.service, "my-service");
+    }
+
+    #[test]
+    fn service_uri_no_scheme() {
+        // bare hostname: no scheme, no host — http crate puts input in path segment
+        let u = super::ServiceUri::parse("my-service").expect("valid URI");
+        assert_eq!(u.service, "my-service");
+        assert!(!u.use_tls);
+    }
+
+    #[test]
+    fn service_uri_bare_with_hyphen() {
+        let u = super::ServiceUri::parse("my-service-foo").expect("valid URI");
+        assert_eq!(u.service, "my-service-foo");
+        assert!(!u.use_tls);
+    }
+
+    #[test]
+    fn service_uri_unknown_scheme_is_err() {
+        assert!(super::ServiceUri::parse("ftp://my-service").is_err());
+        assert!(super::ServiceUri::parse("grpc://my-service").is_err());
+    }
+
+    #[test]
+    fn service_uri_with_path_is_err() {
+        assert!(super::ServiceUri::parse("http://my-service/path").is_err());
+        assert!(super::ServiceUri::parse("my-service/path").is_err());
+    }
+
+    #[test]
+    fn service_uri_with_query_is_err() {
+        assert!(super::ServiceUri::parse("http://my-service?q=1").is_err());
+    }
+
+    #[test]
+    fn service_uri_empty_is_err() {
+        assert!(super::ServiceUri::parse("").is_err());
+    }
+
+    #[test]
+    fn service_uri_no_host_is_err() {
+        assert!(super::ServiceUri::parse("http://").is_err());
+    }
+
+    #[test]
+    fn extract_endpoints_no_ports() {
+        let ep = EndpointSlice {
+            ..Default::default()
+        };
+        assert!(super::extract_endpoints(&ep, "http").is_empty());
+    }
+
+    #[test]
+    fn extract_endpoints_port_absent() {
+        let ep = make_endpoint_slice(&["10.0.0.1"], &[("metrics", 9090)]);
+        assert!(super::extract_endpoints(&ep, "http").is_empty());
+    }
+
+    #[test]
+    fn extract_endpoints_multiple_ips() {
+        let ep = make_endpoint_slice(&["10.0.0.1", "10.0.0.2"], &[("http", 8080)]);
+        let result = super::extract_endpoints(&ep, "http");
+        assert_eq!(result.len(), 2);
+        assert!(result.contains("10.0.0.1:8080"));
+        assert!(result.contains("10.0.0.2:8080"));
+    }
+
+    #[test]
+    fn extract_endpoints_ipv6() {
+        let ep = make_endpoint_slice(&["::1", "fe80::1"], &[("http", 8080)]);
+        let result = super::extract_endpoints(&ep, "http");
+        assert_eq!(result.len(), 2);
+        assert!(result.contains("[::1]:8080"));
+        assert!(result.contains("[fe80::1]:8080"));
+    }
+
+    #[test]
+    fn extract_endpoints_mixed_ports() {
+        let ep = make_endpoint_slice(&["10.0.0.1"], &[("http", 8080), ("grpc", 9000)]);
+        let result = super::extract_endpoints(&ep, "http");
+        assert_eq!(result.len(), 1);
+        assert!(result.contains("10.0.0.1:8080"));
+    }
+
+    #[test]
+    fn extract_endpoints_unready_excluded() {
+        let mut ep = make_endpoint_slice(&["10.0.0.1"], &[("http", 8080)]);
+        ep.endpoints[0].conditions = Some(EndpointConditions {
+            ready: Some(false),
+            ..Default::default()
+        });
+        assert!(super::extract_endpoints(&ep, "http").is_empty());
+    }
+
+    #[test]
+    fn extract_endpoints_ready_none_included() {
+        let mut ep = make_endpoint_slice(&["10.0.0.1"], &[("http", 8080)]);
+        ep.endpoints[0].conditions = None;
+        let result = super::extract_endpoints(&ep, "http");
+        assert!(result.contains("10.0.0.1:8080"));
     }
 }

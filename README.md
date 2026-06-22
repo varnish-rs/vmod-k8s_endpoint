@@ -37,3 +37,56 @@ sub vcl_backend_fetch {
 ### `.backend()`
 
 Returns a random backend from the current pool, or `0` (none) if the pool is empty.
+
+### `.dump()`
+
+Returns a JSON object listing the currently active backend endpoints:
+
+```json
+{
+  "backends": [
+    "10.0.0.1:8080",
+    "10.0.0.2:8080",
+    "10.0.0.3:8080"
+  ]
+}
+```
+
+Useful for synthetic diagnostic responses:
+
+```vcl
+sub vcl_recv {
+    if (req.url == "/backends") {
+        return(synth(200, ""));
+    }
+}
+
+sub vcl_synth {
+    set resp.http.Content-Type = "application/json";
+    set resp.body = director.dump();
+    return(deliver);
+}
+```
+
+## RBAC
+
+When running in-cluster, the Varnish pod's ServiceAccount needs read access to `EndpointSlices`:
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+rules:
+- apiGroups: ["discovery.k8s.io"]
+  resources: ["endpointslices"]
+  verbs: ["get", "list", "watch"]
+```
+
+## Testing with minikube
+
+The `k8s/` directory contains manifests and a deploy script for a local test cluster:
+
+```bash
+k8s/deploy.sh
+```
+
+This starts minikube (if needed), deploys 3 backend pods and a Varnish pod, compiles and loads the VMOD, then prints the active backend list.

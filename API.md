@@ -32,3 +32,7 @@ kubeconfig context or service-account (when running in-cluster).
 ### Method `BACKEND <object>.backend()`
 
 Return a randomly selected backend from the current pool, or `None` if empty.
+
+### Method `STRING <object>.dump()`
+
+Return a pretty-printed JSON object listing all currently active backend addresses.
