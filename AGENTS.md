@@ -32,7 +32,7 @@ VmodDirector::backend()      (VCL request path)
 
 Key types and functions (all in `src/lib.rs`):
 - `ServiceUri` — parses `[http[s]://]service-name` URIs; extracts the service name and whether TLS is requested.
-- `extract_endpoints()` — filters a Kubernetes `Endpoints` object down to `ip:port` strings matching a named port.
+- `extract_endpoints()` — filters a Kubernetes `EndpointSlice` down to `ip:port` strings matching a named port.
 - `watch_endpoints()` — async loop; consumes the kube watcher stream, drives the three-phase backend pool update.
 - `OwnedBackend` — owns a `NativeBackend` + its GC expiry deadline. Lives only inside the watcher task.
 - `VmodDirector` — VCL-visible object; owns the Tokio `Runtime` (keeping it alive keeps the watcher running) and the shared backend map. Constructor takes `service_uri`, `port_name`, and optional `namespace`.
@@ -43,7 +43,7 @@ Key types and functions (all in `src/lib.rs`):
 
 - **One runtime per director.** `VmodDirector` holds its own `tokio::runtime::Runtime`. VCL init is synchronous; the Tokio runtime hosts all async work for that director instance.
 - **GC grace period.** Evicted backends stay in `owned` for `GC_GRACE` (1 s) before being dropped. This lets in-flight Varnish requests finish against a backend that just left Kubernetes.
-- **Shared map type.** `Arc<Mutex<IndexMap<String, SendableBackendRef>>>`. `IndexMap` preserves insertion order for stable random selection.
+- **Shared map type.** `Arc<RwLock<IndexMap<String, SendableBackendRef>>>`. `IndexMap` preserves insertion order for stable random selection.
 - **Three-phase event handling.** On each watcher event: (A) lock → revive/evict/collect new addrs → unlock; (B) build new backends via FFI with no lock held; (C) lock → insert new backends → unlock. Keeps `backend()` unblocked during backend creation.
 - **TLS feature gate.** TLS builder methods (`builder.tls(...)`, `hosthdr`) only exist when compiled with the `varnishsys_90_sslflags` cfg key (Varnish ≥ 7.x with SSL). Guard any TLS code with `#[cfg(varnishsys_90_sslflags)]`.
 

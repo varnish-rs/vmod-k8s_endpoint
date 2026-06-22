@@ -1,0 +1,278 @@
+#!/usr/bin/env just --justfile
+
+main_crate := 'vmod_k8s_endpoint'
+packages := ''
+features := '--all-features'
+targets := '--all-targets'
+
+# which version of Varnish to install by default. Update the `supported_varnish_vers` variable below.
+default_varnish_ver := '9.0'
+
+# Make sure to update CI with the changes.
+supported_varnish_vers := '8.0 9.0'
+
+# if running in CI, treat warnings as errors by setting RUSTFLAGS and RUSTDOCFLAGS to '-D warnings' unless they are already set
+# Use `CI=true just ci-test` to run the same tests as in GitHub CI.
+# Use `just env-info` to see the current values of RUSTFLAGS and RUSTDOCFLAGS
+ci_mode := if env('CI', '') != '' {'1'} else {''}
+# cargo-binstall needs a workaround due to caching
+# ci_mode might be manually set by user, so re-check the env var
+binstall_args := if env('CI', '') != '' {'--no-confirm --no-track --disable-telemetry'} else {''}
+# On macOS, .cargo/config.toml sets `-undefined,dynamic_lookup` so VMOD cdylibs
+# can defer host-symbol resolution to runtime. But cargo precedence drops
+# target.<cfg>.rustflags the moment RUSTFLAGS env is set — which we do below —
+# so the flag has to be in RUSTFLAGS too, otherwise `just build` fails to link.
+macos_link_arg := if os() == 'macos' {' -C link-arg=-Wl,-undefined,dynamic_lookup'} else {''}
+export RUSTFLAGS := env('RUSTFLAGS', (if ci_mode == '1' {'-D warnings'} else {''}) + macos_link_arg)
+export RUSTDOCFLAGS := env('RUSTDOCFLAGS', if ci_mode == '1' {'-D warnings'} else {''})
+export RUST_BACKTRACE := env('RUST_BACKTRACE', if ci_mode == '1' {'1'} else {''})
+
+@_default:
+    {{just_executable()}} --list
+
+# Build the project
+build:
+    cargo build {{packages}} {{features}}
+    cargo build {{packages}} {{features}} {{targets}}
+
+# Quick compile without building a binary
+check:
+    cargo check {{packages}} {{features}} {{targets}}
+
+# Run all tests as expected by CI
+ci-test: env-info test-fmt build clippy test && assert-git-is-clean
+
+ci-test-trunk install_dir:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export "PKG_CONFIG_PATH={{install_dir}}/lib/pkgconfig/"
+    export LD_LIBRARY_PATH={{install_dir}}/lib/
+    export "PATH=$PATH:{{install_dir}}/bin/:{{install_dir}}/sbin/"
+    just build
+    just clippy
+    just test
+
+# Run tests only relevant to the latest Varnish version
+ci-test-latest: ci-test test-doc
+
+# Run minimal subset of tests to ensure compatibility with MSRV
+ci-test-msrv: env-info test
+
+# Clean all build artifacts
+clean:
+    cargo clean
+    rm -f Cargo.lock
+
+# Clean all build artifacts and docker cache
+clean-all: clean
+    rm -rf docker/.cache/*
+    touch docker/.cache/empty_file
+
+# Run cargo clippy to lint the code
+clippy *args:
+    cargo clippy {{packages}} {{features}} {{targets}} {{args}}
+
+docker-run version=default_varnish_ver *args='':  (docker-build-ver version) (docker-run-ver version args)
+
+# Build and open code documentation
+docs *args='--open':
+    DOCS_RS=1 cargo doc --no-deps {{args}} {{packages}}
+
+# Print environment info
+env-info:
+    @echo "Running for '{{main_crate}}' crate {{if ci_mode == '1' {'in CI mode'} else {'in dev mode'} }} on {{os()}} / {{arch()}}"
+    @echo "PWD $(pwd)"
+    {{just_executable()}} --version
+    rustc --version
+    cargo --version
+    rustup --version
+    @echo "RUSTFLAGS='$RUSTFLAGS'"
+    @echo "RUSTDOCFLAGS='$RUSTDOCFLAGS'"
+    @echo "RUST_BACKTRACE='$RUST_BACKTRACE'"
+    just get-varnish-version
+
+# Reformat all code `cargo fmt`. If nightly is available, use it for better results
+fmt:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if (rustup toolchain list | grep nightly && rustup component list --toolchain nightly | grep rustfmt) &> /dev/null; then
+        echo 'Reformatting Rust code using nightly Rust fmt to sort imports'
+        cargo +nightly fmt --all -- --config imports_granularity=Module,group_imports=StdExternalCrate
+    else
+        echo 'Reformatting Rust with the stable cargo fmt.  Install nightly with `rustup install nightly` for better results'
+        cargo fmt --all
+    fi
+
+# Get any package's field from the metadata
+get-crate-field field package=main_crate:  (assert-cmd 'jq')
+    cargo metadata --format-version 1 | jq -e -r '.packages | map(select(.name == "{{package}}")) | first | .{{field}} // error("Field \"{{field}}\" is missing in Cargo.toml for package {{package}}")'
+
+# Get the minimum supported Rust version (MSRV) for the crate
+get-msrv package=main_crate:  (get-crate-field 'rust_version' package)
+
+# Get the version of Varnish installed on the system. If a version arg is provided, check that the installed version is at least that version. If param is 'print', just print the installed version.
+get-varnish-version $required_version='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "${VARNISH_INSTALL_DIR:-}" ]; then
+        export PATH="$VARNISH_INSTALL_DIR/sbin:$PATH"
+    fi
+    VARNISH_VER=$(varnishd -V 2>&1 | sed -n 's/.*varnish-\([^ )]*\).*/\1/p' | head -1)
+    if [ -z "$VARNISH_VER" ]; then
+        echo "ERROR: varnishd not found or version could not be parsed"
+        exit 1
+    elif [ "$required_version" = 'print' ]; then
+        echo "$VARNISH_VER"
+    elif [ -n "$required_version" ]; then
+        if [ "$(printf "$required_version\n$VARNISH_VER" | sort -V | head -n1)" != "$required_version" ]; then
+            echo "ERROR: Varnish version $required_version is required, but $VARNISH_VER is installed."
+            exit 1
+        else
+            echo "Found varnishd $VARNISH_VER >= $required_version"
+        fi
+    else
+        echo "Found varnishd $VARNISH_VER"
+    fi
+
+# Find the minimum supported Rust version (MSRV) using cargo-msrv extension, and update Cargo.toml
+msrv:  (cargo-install 'cargo-msrv')
+    cargo msrv find --write-msrv --ignore-lockfile {{features}} --min 1.77 --component rustfmt -- {{just_executable()}} ci-test-msrv
+
+# Run cargo-release
+release *args='':  (cargo-install 'release-plz')
+    release-plz {{args}}
+
+# Check semver compatibility with prior published version. Install it with `cargo install cargo-semver-checks`
+semver *args:  (cargo-install 'cargo-semver-checks')
+    cargo semver-checks {{features}} {{args}}
+
+# Run all unit and integration tests
+test *args: build
+    cargo test {{packages}} {{features}} {{targets}} {{args}}
+
+# Test documentation generation
+test-doc:  (docs '')
+
+# Test code formatting
+test-fmt:
+    cargo fmt --all -- --check
+
+# Find unused dependencies. Install it with `cargo install cargo-udeps`
+udeps:  (cargo-install 'cargo-udeps')
+    cargo +nightly udeps {{packages}} {{features}} {{targets}}
+
+# Update all dependencies, including breaking changes. Requires nightly toolchain (install with `rustup install nightly`)
+update:
+    cargo +nightly -Z unstable-options update --breaking
+    cargo update
+
+# Ensure that a certain command is available
+[private]
+assert-cmd command:
+    @if ! type {{command}} > /dev/null; then \
+        echo "Command '{{command}}' could not be found. Please make sure it has been installed on your computer." ;\
+        exit 1 ;\
+    fi
+
+# Make sure the git repo has no uncommitted changes
+[private]
+assert-git-is-clean:
+    @if [ -n "$(git status --untracked-files --porcelain)" ]; then \
+      >&2 echo "ERROR: git repo is no longer clean. Make sure compilation and tests artifacts are in the .gitignore, and no repo files are modified." ;\
+      >&2 echo "######### git status ##########" ;\
+      git status ;\
+      git --no-pager diff ;\
+      exit 1 ;\
+    fi
+
+# Check if a certain Cargo command is installed, and install it if needed
+[private]
+cargo-install $COMMAND $INSTALL_CMD='' *args='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if ! command -v $COMMAND > /dev/null; then
+        echo "$COMMAND could not be found. Installing..."
+        if ! command -v cargo-binstall > /dev/null; then
+            set -x
+            cargo install ${INSTALL_CMD:-$COMMAND} --locked {{args}}
+            { set +x; } 2>/dev/null
+        else
+            set -x
+            cargo binstall ${INSTALL_CMD:-$COMMAND} {{binstall_args}} --locked {{args}}
+            { set +x; } 2>/dev/null
+        fi
+    fi
+
+# Build a Docker image with the given Varnish version
+[private]
+docker-build-ver version=default_varnish_ver:
+    #!/usr/bin/env bash
+    set -x
+    set -euo pipefail
+    EXTRA_ARGS=()
+    if [ "{{version}}" = "trunk" ]; then
+        EXTRA_ARGS+=("--build-arg" "VARNISH_INSTALL_DIR=${VARNISH_INSTALL_DIR:-/tmp/varnish-trunk}")
+    fi
+    docker build \
+           --progress=plain \
+           -t "varnish-img-{{version}}" \
+           --build-arg "VARNISH_VERSION={{version}}" \
+           "${EXTRA_ARGS[@]}" \
+           --build-arg USER_UID=$(id -u) \
+           --build-arg USER_GID=$(id -g) \
+           -f docker/Dockerfile \
+           .
+
+# Start docker container with the given varnish version
+[private]
+docker-run-ver version *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p docker/.cache/{{version}}
+    touch docker/.cache/{{version}}/.bash_history
+    TTY=""
+    [ -t 0 ] && TTY="-t"
+    docker run --rm -i $TTY \
+        -v "$PWD:/app/" \
+        -v "$PWD/docker/.cache/{{version}}:/home/user/.cache" \
+        -v "$PWD/docker/.cache/{{version}}/.bash_history:/home/user/.bash_history" \
+        varnish-img-{{version}} {{args}}
+
+# Install Varnish. For a release version, installs from packages.varnish-software.com.
+# For `trunk`, clones https://github.com/varnish/varnish.git, builds, and installs to VARNISH_INSTALL_DIR (default: /tmp/varnish-trunk).
+# This could be damaging to your system - use with caution. Pass non-empty `debug` argument to skip the installation.
+[private]
+install-varnish version=default_varnish_ver debug='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    echo "Installing Varnish '{{version}}'"
+    {{ if debug != '' {'exit 0'} else {''} }}
+
+    if [ "{{version}}" = "trunk" ]; then
+        INSTALL_DIR="${VARNISH_INSTALL_DIR:-/tmp/varnish-trunk}"
+        set -x
+        sudo DEBIAN_FRONTEND=noninteractive \
+             DEBCONF_NONINTERACTIVE_SEEN=true \
+             apt-get install -qqq autoconf automake flex libtool python3-sphinx libpcre2-dev libedit-dev libssl-dev
+        git clone --depth=1 --recursive https://github.com/varnish/varnish.git /tmp/varnish-src
+        cd /tmp/varnish-src
+        ./autogen.des --prefix="$INSTALL_DIR" --mandir="$INSTALL_DIR/man"
+        make -j$(nproc)
+        sudo make install
+        rm -rf /tmp/varnish-src
+    else
+        set -x
+        curl -Ls https://packages.varnish-software.com/varnish/bootstrap-deb.sh | sudo sh
+
+        cat << -EOF | sudo tee /etc/apt/preferences.d/varnish
+            Package: varnish varnish-dev
+            Pin: origin "packages.varnish-software.com"
+            Pin: version {{version}}
+            Pin-Priority: 1001
+    -EOF
+        cat /etc/apt/preferences.d/varnish
+
+        sudo apt-cache policy "varnish"
+        sudo apt-get install -y "varnish={{version}}*" "varnish-dev={{version}}*"
+    fi

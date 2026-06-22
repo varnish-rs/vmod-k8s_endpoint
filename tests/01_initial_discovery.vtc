@@ -1,0 +1,86 @@
+varnishtest "k8s-endpoint: initial endpoint discovery"
+
+# Barrier keeps s_k8s alive until after the client verifies the 200 response.
+# Without this, kube-rs rapid-retries fill varnishtest's log buffer.
+barrier b1 cond 2
+
+# Backend that Varnish will route traffic to once the VMOD discovers it
+server s_backend {
+    rxreq
+    txresp -body "hello from backend"
+} -start
+
+# Mock Kubernetes API server: one LIST, one empty WATCH, then absorb the
+# inevitable re-LIST so kube-rs hangs silently rather than rapid-retrying.
+server s_k8s {
+    rxreq
+    expect req.url ~ "namespaces/default/endpointslices"
+    txresp -hdr "Content-Type: application/json" -body {{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","metadata":{"resourceVersion":"1"},"items":[{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"my-service-ep","namespace":"default","resourceVersion":"1"},"addressType":"IPv4","endpoints":[{"addresses":["${s_backend_addr}"],"conditions":{"ready":true}}],"ports":[{"name":"http","port":${s_backend_port},"protocol":"TCP"}]}]}}
+
+    rxreq
+    expect req.url ~ "watch=true"
+    txresp -hdr "Content-Type: application/json;stream=watch" -body ""
+
+    # After an empty WATCH, kube-rs transitions back to the LIST state and
+    # immediately re-LISTs. Accept that request without responding — kube-rs
+    # will wait silently for a response rather than connection-refused spinning.
+    rxreq
+    barrier b1 sync
+} -start
+
+shell {
+    cat > ${tmpdir}/kubeconfig.yaml << 'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: http://${s_k8s_addr}:${s_k8s_port}
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: test
+  name: test
+current-context: test
+users:
+- name: test
+EOF
+}
+
+setenv KUBECONFIG "${tmpdir}/kubeconfig.yaml"
+
+varnish v1 -vcl {
+    import k8s_endpoint from "${vmod}";
+
+    backend default none;
+
+    sub vcl_init {
+        new d = k8s_endpoint.new(
+            "my-service", "http", namespace="default"
+        );
+    }
+
+    sub vcl_recv {
+        set req.backend_hint = d.backend();
+        return(pass);
+    }
+} -start
+
+# Poll until the k8s backend appears in Varnish (up to 5s)
+shell {
+    n=0
+    until varnishadm -n ${tmpdir}/v1 backend.list 2>/dev/null | grep -q k8s_endpoint || [ $n -ge 50 ]; do
+        sleep 0.1
+        n=$((n+1))
+    done
+    [ $n -lt 50 ]
+}
+
+client c1 {
+    txreq
+    rxresp
+    expect resp.status == 200
+    expect resp.body == "hello from backend"
+} -run
+
+barrier b1 sync

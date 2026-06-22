@@ -1,0 +1,80 @@
+varnishtest "k8s-endpoint: endpoint removal via WATCH DELETE event"
+
+# Barrier keeps s_k8s alive until after the client verifies the 503 response.
+# Without this, kube-rs rapid-retries fill varnishtest's log buffer.
+barrier b1 cond 2
+
+# Backend address used in the initial k8s response; traffic never flows here after DELETE
+server s_backend {
+} -start
+
+# Mock Kubernetes API server: LIST shows backend, WATCH immediately DELETEs it,
+# then absorb the inevitable re-LIST so kube-rs hangs silently.
+server s_k8s {
+    rxreq
+    expect req.url ~ "namespaces/default/endpointslices"
+    txresp -hdr "Content-Type: application/json" -body {{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","metadata":{"resourceVersion":"1"},"items":[{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"my-service-ep","namespace":"default","resourceVersion":"1"},"addressType":"IPv4","endpoints":[{"addresses":["${s_backend_addr}"],"conditions":{"ready":true}}],"ports":[{"name":"http","port":${s_backend_port},"protocol":"TCP"}]}]}}
+
+    rxreq
+    expect req.url ~ "watch=true"
+    txresp -hdr "Content-Type: application/json;stream=watch" -body {{"type":"DELETED","object":{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"my-service-ep","namespace":"default","resourceVersion":"2"},"addressType":"IPv4","endpoints":[],"ports":[]}}}
+
+    # After DELETED, kube-rs transitions back to LIST state. Accept the re-LIST
+    # without responding — kube-rs waits silently instead of connection-refused spinning.
+    rxreq
+    barrier b1 sync
+} -start
+
+shell {
+    cat > ${tmpdir}/kubeconfig.yaml << 'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: http://${s_k8s_addr}:${s_k8s_port}
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: test
+  name: test
+current-context: test
+users:
+- name: test
+EOF
+}
+
+setenv KUBECONFIG "${tmpdir}/kubeconfig.yaml"
+
+varnish v1 -vcl {
+    import k8s_endpoint from "${vmod}";
+
+    # With no active backends, requests fall to default none -> 503
+    backend default none;
+
+    sub vcl_init {
+        new d = k8s_endpoint.new(
+            "my-service", "http", namespace="default"
+        );
+    }
+
+    sub vcl_recv {
+        set req.backend_hint = d.backend();
+        return(pass);
+    }
+} -start
+
+# Wait for the watcher to process both the initial LIST (adds backend)
+# and the WATCH DELETE (removes it from the active pool).
+# The backend remains registered in Varnish during the GC grace period,
+# so backend.list cannot be used to detect removal; a fixed delay is the
+# most reliable approach here.
+delay 1
+
+client c1 {
+    txreq
+    rxresp
+    expect resp.status == 503
+} -run
+
+barrier b1 sync

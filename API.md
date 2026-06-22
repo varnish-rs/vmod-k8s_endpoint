@@ -26,7 +26,8 @@ import k8s_endpoint from "path/to/libk8s_endpoint.so";
 Construct a new director and start watching the given Kubernetes service.
 Creates a dedicated Tokio runtime and spawns a background watcher task on it.
 
-`namespace`: scope the watch to a specific namespace; omit to watch all namespaces.
+`namespace`: Kubernetes namespace to watch. Defaults to the namespace from the active
+kubeconfig context or service-account (when running in-cluster).
 
 ### Method `BACKEND <object>.backend()`
 
