@@ -7,9 +7,9 @@ use kube::{api::Api, Client};
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::net::SocketAddr;
+use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use std::sync::mpsc;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep_until, Instant};
 use varnish::ffi;
@@ -86,8 +86,12 @@ mod k8s_endpoint {
             if let Some(rx) = ready_rx {
                 rx.recv_timeout(Duration::from_secs(30))
                     .map_err(|e| match e {
-                        mpsc::RecvTimeoutError::Timeout => "timed out waiting for initial endpoint discovery (30s)".to_string(),
-                        mpsc::RecvTimeoutError::Disconnected => "watcher exited before completing initial discovery".to_string(),
+                        mpsc::RecvTimeoutError::Timeout => {
+                            "timed out waiting for initial endpoint discovery (30s)".to_string()
+                        }
+                        mpsc::RecvTimeoutError::Disconnected => {
+                            "watcher exited before completing initial discovery".to_string()
+                        }
                     })?;
             }
 
@@ -110,9 +114,7 @@ mod k8s_endpoint {
             if map.is_empty() {
                 return "{\n  \"backends\": []\n}".to_string();
             }
-            let entries: Vec<String> = map.keys()
-                .map(|addr| format!("    \"{}\"", addr))
-                .collect();
+            let entries: Vec<String> = map.keys().map(|addr| format!("    \"{}\"", addr)).collect();
             format!("{{\n  \"backends\": [\n{}\n  ]\n}}", entries.join(",\n"))
         }
     }
