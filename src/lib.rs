@@ -9,6 +9,7 @@ use std::ffi::CString;
 use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use std::sync::mpsc;
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep_until, Instant};
 use varnish::ffi;
@@ -25,11 +26,16 @@ mod k8s_endpoint {
         ///
         /// `namespace`: Kubernetes namespace to watch. Defaults to the namespace from the active
         /// kubeconfig context or service-account (when running in-cluster).
+        ///
+        /// `wait_for_initial`: Block until the first endpoint list has been fetched from the
+        /// Kubernetes API and all backends are registered. Defaults to `true`. Set to `false`
+        /// to return immediately and discover backends in the background.
         pub fn new(
             ctx: &mut Ctx,
             service_uri: &str,
             port_name: &str,
             namespace: Option<&str>,
+            wait_for_initial: Option<bool>,
         ) -> Result<Self, String> {
             let service = ServiceUri::parse(service_uri).map_err(|e| e.to_string())?;
 
@@ -61,6 +67,13 @@ mod k8s_endpoint {
 
             let vcl = super::RawVclPtr(ctx.raw.vcl.0);
             let port_name = port_name.to_string();
+            let wait = wait_for_initial.unwrap_or(true);
+            let (ready_tx, ready_rx) = if wait {
+                let (tx, rx) = mpsc::sync_channel::<()>(1);
+                (Some(tx), Some(rx))
+            } else {
+                (None, None)
+            };
             runtime.spawn(super::watch_endpoints(
                 stream,
                 port_name,
@@ -68,7 +81,15 @@ mod k8s_endpoint {
                 service.use_tls,
                 backends.clone(),
                 vcl,
+                ready_tx,
             ));
+            if let Some(rx) = ready_rx {
+                rx.recv_timeout(Duration::from_secs(30))
+                    .map_err(|e| match e {
+                        mpsc::RecvTimeoutError::Timeout => "timed out waiting for initial endpoint discovery (30s)".to_string(),
+                        mpsc::RecvTimeoutError::Disconnected => "watcher exited before completing initial discovery".to_string(),
+                    })?;
+            }
 
             Ok(VmodDirector { backends, runtime })
         }
@@ -199,6 +220,7 @@ async fn watch_endpoints(
     use_tls: bool,
     backends: Arc<RwLock<IndexMap<String, SendableBackendRef>>>,
     raw_vcl: RawVclPtr,
+    mut ready_tx: Option<mpsc::SyncSender<()>>,
 ) {
     const GC_GRACE: Duration = Duration::from_secs(65);
     // Suppress unused-variable warnings on Varnish builds without SSL flags.
@@ -218,38 +240,25 @@ async fn watch_endpoints(
     let gc_timer = sleep_until(Instant::now());
     tokio::pin!(gc_timer);
 
-    // Rate-limit error logging: kube-rs may retry at high frequency on connection
-    // errors, and each retry would otherwise produce a VSL Error entry.
-    let mut last_error_log: Option<Instant> = None;
-    const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
-
     loop {
         tokio::select! {
             result = stream.try_next() => {
                 let result = match result {
                     Ok(r) => r,
                     Err(e) => {
-                        let now = Instant::now();
-                        // kube-rs has no backoff for connection errors and retries at ~1ms
-                        // intervals, so we rate-limit logging rather than adding a sleep
-                        // (which would interfere with kube-rs's own retry state machine).
-                        if last_error_log.is_none_or(|t| now.duration_since(t) >= ERROR_LOG_INTERVAL) {
-                            vsl_log(LogTag::Error, format!("k8s-endpoint: watcher error: {e}"));
-                            last_error_log = Some(now);
-                        }
+                        vsl_log(LogTag::Error, format!("k8s_endpoint: watcher error: {e}"));
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                         continue;
                     }
                 };
                 let Some(status) = result else {
-                    vsl_log(LogTag::Error, "k8s-endpoint: watcher stream ended; no further endpoint updates");
+                    vsl_log(LogTag::Error, "k8s_endpoint: watcher stream ended; no further endpoint updates");
                     break;
                 };
-                last_error_log = None; // connectivity restored; next error logs immediately
-
                 let new_endpoints: HashSet<String> = match status {
                     Event::Apply(slice) | Event::InitApply(slice) => {
                         let Some(name) = slice.metadata.name.clone() else {
-                            vsl_log(LogTag::Error, "k8s-endpoint: EndpointSlice has no metadata.name, skipping");
+                            vsl_log(LogTag::Error, "k8s_endpoint: EndpointSlice has no metadata.name, skipping");
                             continue;
                         };
                         slices.insert(name, extract_endpoints(&slice, &port_name));
@@ -263,7 +272,12 @@ async fn watch_endpoints(
                         slices.values().flatten().cloned().collect()
                     }
                     Event::Init => { slices.clear(); continue; }
-                    Event::InitDone => continue,
+                    Event::InitDone => {
+                        if let Some(tx) = ready_tx.take() {
+                            let _ = tx.try_send(());
+                        }
+                        continue;
+                    }
                 };
 
                 // Phase A (under lock): revive grace-period backends, remove stale entries,
@@ -287,7 +301,7 @@ async fn watch_endpoints(
                         .filter_map(|addr| match addr.parse::<SocketAddr>() {
                             Ok(sa) => Some((addr.clone(), sa)),
                             Err(e) => {
-                                vsl_log(LogTag::Error, format!("k8s-endpoint: bad endpoint address {addr}: {e}"));
+                                vsl_log(LogTag::Error, format!("k8s_endpoint: bad endpoint address {addr}: {e}"));
                                 None
                             }
                         })
@@ -324,7 +338,7 @@ async fn watch_endpoints(
                         match unsafe { builder.build_with_vcl(raw_vcl.0) } {
                             Ok(backend) => Some((addr_str, backend)),
                             Err(e) => {
-                                vsl_log(LogTag::Error, format!("k8s-endpoint: failed to create backend for {addr_str}: {e}"));
+                                vsl_log(LogTag::Error, format!("k8s_endpoint: failed to create backend for {addr_str}: {e}"));
                                 None
                             }
                         }

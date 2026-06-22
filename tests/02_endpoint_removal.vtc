@@ -1,4 +1,4 @@
-varnishtest "k8s-endpoint: endpoint removal via WATCH DELETE event"
+varnishtest "k8s_endpoint: endpoint removal via WATCH DELETE event"
 
 # Barrier keeps s_k8s alive until after the client verifies the 503 response.
 # Without this, kube-rs rapid-retries fill varnishtest's log buffer.

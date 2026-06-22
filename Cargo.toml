@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Varnish VMOD: Kubernetes endpoint discovery director"
 authors = ["Guillaume Quintard <guillaume.quintard@varnish-software.com>"]
-repository = "https://github.com/varnish/vmod-k8s-endpoint"
+repository = "https://github.com/varnish/vmod-k8s_endpoint"
 license = "MIT"
 rust-version = "1.90"
 

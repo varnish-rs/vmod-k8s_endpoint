@@ -1,4 +1,4 @@
-# vmod-k8s-endpoint
+# vmod-k8s_endpoint
 
 Varnish VMOD that watches a Kubernetes service's endpoints and exposes them as a randomly-selected director. Backends are added and removed automatically as pods come and go.
 

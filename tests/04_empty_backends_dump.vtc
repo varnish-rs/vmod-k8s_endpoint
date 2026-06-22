@@ -1,0 +1,57 @@
+varnishtest "k8s_endpoint: wait_for_initial=false with unreachable k8s loads VCL and dump returns empty JSON"
+
+# Simulates fully dead infrastructure: no k8s API server at all.
+# wait_for_initial=false makes new() return immediately without connecting.
+# The background watcher will fail silently. dump() must return an empty list.
+
+shell {
+    cat > ${tmpdir}/kubeconfig.yaml << 'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: http://${bad_ip}
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: test
+  name: test
+current-context: test
+users:
+- name: test
+EOF
+}
+
+setenv KUBECONFIG "${tmpdir}/kubeconfig.yaml"
+
+varnish v1 -vcl {
+    import k8s_endpoint from "${vmod}";
+
+    backend default none;
+
+    sub vcl_init {
+        new d = k8s_endpoint.new(
+            "my-service", "http", namespace="default",
+            wait_for_initial=false
+        );
+    }
+
+    sub vcl_recv {
+        return(synth(200, "ok"));
+    }
+
+    sub vcl_synth {
+        set resp.http.Content-Type = "application/json";
+        synthetic(d.dump());
+        return(deliver);
+    }
+} -start
+
+client c1 {
+    txreq
+    rxresp
+    expect resp.status == 200
+    expect resp.http.Content-Type == "application/json"
+    expect resp.body ~ {"backends": \[\]}
+} -run

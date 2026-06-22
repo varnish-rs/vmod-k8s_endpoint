@@ -1,0 +1,63 @@
+varnishtest "k8s_endpoint: .dump() in vcl_init does not crash"
+
+barrier b1 cond 2
+
+server s_k8s {
+    rxreq
+    expect req.url ~ "namespaces/default/endpointslices"
+    txresp -hdr "Content-Type: application/json" -body {{"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSliceList","metadata":{"resourceVersion":"1"},"items":[]}}
+
+    rxreq
+    expect req.url ~ "watch=true"
+    txresp -hdr "Content-Type: application/json;stream=watch" -body ""
+
+    rxreq
+    barrier b1 sync
+} -start
+
+shell {
+    cat > ${tmpdir}/kubeconfig.yaml << 'EOF'
+apiVersion: v1
+kind: Config
+clusters:
+- cluster:
+    server: http://${s_k8s_addr}:${s_k8s_port}
+  name: test
+contexts:
+- context:
+    cluster: test
+    user: test
+  name: test
+current-context: test
+users:
+- name: test
+EOF
+}
+
+setenv KUBECONFIG "${tmpdir}/kubeconfig.yaml"
+
+varnish v1 -vcl {
+    import k8s_endpoint from "${vmod}";
+    import std;
+
+    backend default none;
+
+    sub vcl_init {
+        new d = k8s_endpoint.new(
+            "my-service", "http", namespace="default"
+        );
+        std.log("dump: " + d.dump());
+    }
+
+    sub vcl_recv {
+        return(synth(200, "ok"));
+    }
+} -start
+
+client c1 {
+    txreq
+    rxresp
+    expect resp.status == 200
+} -run
+
+barrier b1 sync

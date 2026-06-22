@@ -4,7 +4,7 @@ Guidance for AI agents working on this repository.
 
 ## What this is
 
-`vmod-k8s-endpoint` is a Varnish VMOD (compiled as a `cdylib`) that watches a Kubernetes service's `Endpoints` resource and exposes the live pod addresses as a randomly-selected Varnish director. All source lives in `src/lib.rs`.
+`vmod-k8s_endpoint` is a Varnish VMOD (compiled as a `cdylib`) that watches a Kubernetes service's `EndpointSlices` resource and exposes the live pod addresses as a randomly-selected Varnish director. All source lives in `src/lib.rs`.
 
 ## Build
 
@@ -28,6 +28,9 @@ VmodDirector::new()          (VCL init, synchronous)
 
 VmodDirector::backend()      (VCL request path)
   └─ lock shared map, pick random SendableBackendRef, return inner BackendRef
+
+VmodDirector::dump()         (VCL request path)
+  └─ lock shared map, format active endpoint addresses as pretty-printed JSON
 ```
 
 Key types and functions (all in `src/lib.rs`):
@@ -42,7 +45,7 @@ Key types and functions (all in `src/lib.rs`):
 ## Patterns to follow
 
 - **One runtime per director.** `VmodDirector` holds its own `tokio::runtime::Runtime`. VCL init is synchronous; the Tokio runtime hosts all async work for that director instance.
-- **GC grace period.** Evicted backends stay in `owned` for `GC_GRACE` (1 s) before being dropped. This lets in-flight Varnish requests finish against a backend that just left Kubernetes.
+- **GC grace period.** Evicted backends stay in `owned` for `GC_GRACE` (65 s) before being dropped. This lets in-flight Varnish requests finish against a backend that just left Kubernetes.
 - **Shared map type.** `Arc<RwLock<IndexMap<String, SendableBackendRef>>>`. `IndexMap` preserves insertion order for stable random selection.
 - **Three-phase event handling.** On each watcher event: (A) lock → revive/evict/collect new addrs → unlock; (B) build new backends via FFI with no lock held; (C) lock → insert new backends → unlock. Keeps `backend()` unblocked during backend creation.
 - **TLS feature gate.** TLS builder methods (`builder.tls(...)`, `hosthdr`) only exist when compiled with the `varnishsys_90_sslflags` cfg key (Varnish ≥ 7.x with SSL). Guard any TLS code with `#[cfg(varnishsys_90_sslflags)]`.

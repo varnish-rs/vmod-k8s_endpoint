@@ -1,4 +1,4 @@
-varnishtest "k8s-endpoint: initial endpoint discovery"
+varnishtest "k8s_endpoint: initial endpoint discovery"
 
 # Barrier keeps s_k8s alive until after the client verifies the 200 response.
 # Without this, kube-rs rapid-retries fill varnishtest's log buffer.

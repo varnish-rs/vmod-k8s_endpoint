@@ -21,13 +21,17 @@ import k8s_endpoint from "path/to/libk8s_endpoint.so";
 
 ## Object `VmodDirector`
 
-### Constructor `k8s_endpoint.new(STRING service_uri, STRING port_name, [STRING namespace])`
+### Constructor `k8s_endpoint.new(STRING service_uri, STRING port_name, [STRING namespace], [BOOL wait_for_initial])`
 
 Construct a new director and start watching the given Kubernetes service.
 Creates a dedicated Tokio runtime and spawns a background watcher task on it.
 
 `namespace`: Kubernetes namespace to watch. Defaults to the namespace from the active
 kubeconfig context or service-account (when running in-cluster).
+
+`wait_for_initial`: Block until the first endpoint list has been fetched from the
+Kubernetes API and all backends are registered. Defaults to `true`. Set to `false`
+to return immediately and discover backends in the background.
 
 ### Method `BACKEND <object>.backend()`
 
