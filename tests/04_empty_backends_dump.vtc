@@ -43,7 +43,7 @@ varnish v1 -vcl {
 
     sub vcl_synth {
         set resp.http.Content-Type = "application/json";
-        synthetic(d.dump());
+        set resp.body = d.dump();
         return(deliver);
     }
 } -start
